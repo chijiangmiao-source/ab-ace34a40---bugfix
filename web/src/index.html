@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>安全规程 · 正当性维持系统</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>安全规程 · 事实撤回与依据传播</h1>
+    <div id="health" class="health health-unknown" title="接口可用性">
+      <span id="health-dot" class="dot"></span>
+      <span id="health-text">检测中…</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- 左列: 规程编辑 -->
+    <section class="panel">
+      <h2>规程编辑</h2>
+
+      <form id="form-fact" class="editor">
+        <h3>新增事实（唯一标识）</h3>
+        <div class="row">
+          <input name="id" placeholder="事实标识，如 sensor_smoke_ok" required />
+          <button type="submit">添加事实</button>
+        </div>
+      </form>
+
+      <form id="form-rule" class="editor">
+        <h3>新增正向规则（无变量）</h3>
+        <label>规则标识 <input name="id" placeholder="rule_evacuate" required /></label>
+        <label>结论标识 <input name="conclusion" placeholder="must_evacuate" required /></label>
+        <label>前提（逗号分隔，须引用既有事实或结论）
+          <input name="antecedents" placeholder="sensor_smoke_ok, manual_alarm_ok" required />
+        </label>
+        <button type="submit">添加规则</button>
+      </form>
+
+      <div id="error-box" class="error-box" hidden></div>
+    </section>
+
+    <!-- 中列: 事实与规则 -->
+    <section class="panel">
+      <h2>事实与规则</h2>
+      <h3>事实</h3>
+      <table class="data" id="facts-table">
+        <thead><tr><th>标识</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+
+      <h3>规则</h3>
+      <table class="data" id="rules-table">
+        <thead><tr><th>标识</th><th>规则</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- 右列: 结论与依据 -->
+    <section class="panel">
+      <h2>结论与完整依据</h2>
+      <div id="conclusions"></div>
+    </section>
+  </main>
+
+  <!-- 撤回裁决 -->
+  <section class="panel verdict-panel">
+    <h2>最近一次撤回裁决</h2>
+    <div id="verdict" class="verdict muted">尚无撤回操作。撤回一个事实后，此处将展示被撤回事实、受影响结论、每项结论的完整依据，以及支持耗尽形成的传播链。</div>
+  </section>
+
+  <footer>
+    <span>每次规则触发保存完整前提集合 · 撤回经真实接口在单一持久化事务内沿反向索引传播</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

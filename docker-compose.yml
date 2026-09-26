@@ -1,0 +1,39 @@
+services:
+  web:
+    build: .
+    image: safety-procedure-tms:latest
+    environment:
+      # 宿主机端口可经 .env / 环境变量 HOST_PORT 配置
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      DB_PATH: /data/procedure.db
+      SEED_DEMO: "1"
+    ports:
+      # 宿主机端口可配置: HOST_PORT=9090 docker compose up web
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - tms-data:/data
+    healthcheck:
+      # 健康路径反映接口/持久层可用性
+      test: ["CMD", "python", "-c",
+             "import json,urllib.request,sys; h=json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/health',timeout=3)); sys.exit(0 if h['status']=='ok' else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    restart: unless-stopped
+
+  # 一次性验证: 运行规则逻辑测试 -> 构建页面 -> API/HTTP 冒烟,
+  # 完成后退出并以退出码报告结果。
+  # 用法: docker compose build verify && docker compose up --exit-code-from verify verify
+  verify:
+    build: .
+    image: safety-procedure-tms:latest
+    environment:
+      SMOKE_PORT: "8099"
+      PYTHONPATH: /app
+    entrypoint: ["bash", "scripts/verify.sh"]
+    restart: "no"
+
+volumes:
+  tms-data:
