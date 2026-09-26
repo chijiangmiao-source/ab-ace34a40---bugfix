@@ -60,10 +60,41 @@ class RetractionTests(unittest.TestCase):
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0].rule_id, "r2")
         self.assertEqual(remaining[0].basis, ("f2", "f3"))
+        # 下游 d 的当前完整依据同步换成替代路径, 不得保留已撤回的 f1
+        d_supports = t.explain("d")
+        self.assertEqual(len(d_supports), 1)
+        self.assertEqual(d_supports[0].rule_id, "r3")
+        self.assertEqual(d_supports[0].basis, ("f2", "f3"))
         # 耗尽的支持留痕
         self.assertEqual([s.rule_id for s in t.nodes["c"].retired_supports], ["r1"])
         # 受影响集合只含事实本身 (无结论失效)
         self.assertEqual([a.node_id for a in rec.affected], ["f1"])
+
+    def test_basis_refresh_cascades_through_surviving_intermediates(self):
+        # 更深的链路: 中间结论逐层靠替代路径存活时, 所有有效下游结论的
+        # 当前依据都必须同步换成当前完整事实依据
+        t = TMS()
+        for f in ("a", "b"):
+            t.add_fact(f)
+        t.add_rule("r1", "m", ["a"])
+        t.add_rule("r2", "m", ["b"])
+        t.add_rule("r3", "p", ["m"])
+        t.add_rule("r4", "q", ["p"])
+        t.add_rule("r5", "q", ["a"])
+        t.add_rule("r6", "w", ["q"])
+        t.retract("a")
+        for node in ("m", "p", "q", "w"):
+            self.assertEqual(t.nodes[node].status, "active", node)
+        self.assertEqual(t.explain("p")[0].basis, ("b",))
+        self.assertEqual(t.explain("q")[0].basis, ("b",))
+        self.assertEqual(t.explain("w")[0].basis, ("b",))
+        # 再撤回 b: 整链失效, 传播链每步依据都是失效时刻实际有效的依据
+        rec2 = t.retract("b")
+        self.assertEqual(t.nodes["w"].status, "inactive")
+        self.assertEqual([s.node_id for s in rec2.propagation_chain],
+                         ["m", "p", "q", "w"])
+        for step in rec2.propagation_chain:
+            self.assertEqual(step.exhausted_basis, ("b",), step.node_id)
 
     def test_retract_last_support_propagates_downstream(self):
         t = two_path_tms()

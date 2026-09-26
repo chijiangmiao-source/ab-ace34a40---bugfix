@@ -91,17 +91,21 @@ class Store:
         rows = self._conn.execute("SELECT id, active FROM facts ORDER BY id").fetchall()
         for row in rows:
             t.add_fact(row["id"])
+        # 先恢复事实撤回状态, 再加入规则: 装载求值直接在最终事实状态下进行,
+        # 不会算出 "全部事实仍有效" 的瞬时依据 (避免过期依据混入状态)
+        for row in rows:
+            if not row["active"]:
+                t.nodes[row["id"]].fact_active = False
         rules = self._conn.execute(
             "SELECT id, conclusion, antecedents FROM rules ORDER BY id"
         ).fetchall()
         for row in rules:  # 加入时会重算当前支持
             ants: List[str] = json.loads(row["antecedents"])
             t.add_rule(row["id"], row["conclusion"], ants)
-        # 恢复事实撤回状态后重算
-        for row in rows:
-            if not row["active"]:
-                t.nodes[row["id"]].fact_active = False
         t.refresh()
+        # 装载时的重算不产生真实历史: 已耗尽的历史依据只以持久化记录为准
+        for st in t.nodes.values():
+            st.retired_supports.clear()
 
         active_supports: Dict[str, List[Support]] = {}
         current = self._conn.execute(
