@@ -127,7 +127,6 @@ class TMS:
         self.nodes: Dict[str, NodeState] = {}
         self.retraction_order: List[str] = []   # 事实撤回的先后顺序
         self._last_records: Dict[str, RetractionRecord] = {}
-        self._retraction_basis: Dict[str, Tuple[str, ...]] = {}
 
     # ------------------------------------------------------------------ #
     # 规程编辑
@@ -345,8 +344,6 @@ class TMS:
         if not st.fact_active:
             return self._stable_past_verdict(fact_id)
 
-        self._retraction_basis = self._capture_retraction_basis()
-
         # 撤回前快照: 哪些结论有效、依据是什么 (supports 与 status 始终同步)
         before_active: Set[str] = set()
         before_supports: Dict[str, List[Support]] = {}
@@ -379,9 +376,11 @@ class TMS:
 
         # 队列元素为发生变化的节点: 失效 (向下传播失效) 或依据集变化但存活
         # (向下刷新展开依据, 例如上游从路径一切换到路径二).
+        # 规则图经校验无环且撤回单调 (支持只会耗尽或切换到更小的事实依据),
+        # 因此同一节点可因不同上游的变化被多次入队, 直到不动点收敛, 不会死循环;
+        # 不能用 "已入队" 去重 —— 菱形/多跳场景下节点可能需要二次向下传播.
         queue: List[str] = [fact_id]
         deactivated: Set[str] = {fact_id}
-        refreshed: Set[str] = set()
         while queue:
             changed = queue.pop(0)
             for rule_id, node in reverse_index.get(changed, []):
@@ -394,14 +393,17 @@ class TMS:
                 node_lost_support = False
                 node_basis_shifted = False
                 if existing is not None and sup is None:
-                    # 该规则的完整支持此刻耗尽 (撤回单调移除, 支持不可能新增)
+                    # 该规则的完整支持此刻耗尽 (撤回单调移除, 支持不可能新增).
+                    # 入队传播是自底向上的: 上游结论的支持在其前驱被处理时就已
+                    # 就地刷新, 故此处 existing.basis 即失效前最后一刻的完整依据.
                     nst.supports.remove(existing)
                     if existing not in nst.retired_supports:
                         nst.retired_supports.append(existing)
                     exhausted_by_node.setdefault(node, []).append(existing)
                     node_lost_support = True
                 elif existing is not None and sup is not None and existing.basis != sup.basis:
-                    # 规则仍成立, 但其事实层展开依据随上游切换而变化
+                    # 规则仍成立, 但其事实层展开依据随上游切换而变化 ——
+                    # 所有有效下游结论都必须同步换成当前完整事实依据.
                     idx = nst.supports.index(existing)
                     nst.supports[idx] = sup
                     node_basis_shifted = True
@@ -428,21 +430,18 @@ class TMS:
                         triggered_by=changed,
                     ))
                     deactivated.add(node)
-                    refreshed.discard(node)
                     if node in survived:
                         survived.remove(node)
                     queue.append(node)
                 elif node_lost_support:
-                    # 丢失了部分支持但仍有完整支持 (替代路径) —— 结论保持有效
+                    # 丢失了部分支持但仍有完整支持 (替代路径) —— 结论保持有效,
+                    # 并继续向下游同步刷新后的完整事实依据.
                     nst.status = "active"
                     if node not in survived:
                         survived.append(node)
-                    if node not in refreshed:
-                        refreshed.add(node)
-                        queue.append(node)
-                elif node_basis_shifted and node not in refreshed:
+                    queue.append(node)
+                elif node_basis_shifted:
                     # 仅依据展开发生变化: 继续向下游刷新, 但不算替代依据幸存
-                    refreshed.add(node)
                     queue.append(node)
 
         record = RetractionRecord(
@@ -453,27 +452,18 @@ class TMS:
             survived=survived,
         )
         self._last_records[fact_id] = record
-        self._retraction_basis = {}
         return record
 
-    def _capture_retraction_basis(self) -> Dict[str, Tuple[str, ...]]:
-        basis_by_rule: Dict[str, Tuple[str, ...]] = {}
-        for st in self.nodes.values():
-            if st.is_fact or st.status != "active":
-                continue
-            for support in st.supports:
-                basis_by_rule.setdefault(support.rule_id, support.basis)
-        return basis_by_rule
-
     def _current_support(self, r: Rule) -> Optional[Support]:
-        """若规则前提此刻全部有效, 构造完整支持 (含事实层展开依据), 否则 None。"""
+        """若规则前提此刻全部有效, 构造完整支持 (含事实层展开依据), 否则 None。
+
+        事实层依据一律按 *当前* 状态实时展开: 上游结论已切换到替代支持时,
+        本规则的依据必须同步换成该替代支持的完整事实依据 —— 已撤回的事实
+        不会残留在有效结论的依据中. 规则的当前支持在反向传播时被就地刷新,
+        因此某条支持真正耗尽时, 其留痕依据就是失效前最后一刻的完整依据.
+        """
         if not all(self._is_active_now(a) for a in r.antecedents):
             return None
-        retained_basis = self._retraction_basis.get(r.rule_id)
-        if retained_basis is not None:
-            return Support(rule_id=r.rule_id,
-                           antecedents=tuple(r.antecedents),
-                           basis=retained_basis)
         basis: Set[str] = set()
         for a in r.antecedents:
             ast = self.nodes[a]

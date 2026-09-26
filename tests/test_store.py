@@ -56,6 +56,43 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([a.node_id for a in again.affected], ["f1"])
         store4.close()
 
+    def test_restart_between_retractions_keeps_current_basis(self):
+        """两次撤回之间重启: 有效结论的当前依据不得残留已撤回事实。"""
+        store = Store(self.db)
+        self._build(store)
+        store.retract_fact("f1")
+        store.close()
+
+        # 重启时 f1 已撤回而 c/d 仍有效 (替代路径): 两层当前依据都必须是 {f2, f3}
+        mid = Store(self.db)
+        self.assertEqual(mid.tms.nodes["c"].status, "active")
+        self.assertEqual(mid.tms.nodes["d"].status, "active")
+        self.assertEqual(mid.tms.explain("c")[0].basis, ("f2", "f3"))
+        self.assertEqual(mid.tms.explain("d")[0].basis, ("f2", "f3"))
+        # 历史依据只含已真正耗尽的路径一
+        self.assertEqual([s.rule_id for s in mid.tms.nodes["c"].retired_supports],
+                         ["r1"])
+
+        # 在重启后的进程里撤回最后一条支持: 传播链每步依据都与当时有效支持一致
+        rec2 = mid.retract_fact("f2")
+        chain_basis = [(s.node_id, s.exhausted_basis)
+                       for s in rec2.propagation_chain]
+        self.assertEqual(chain_basis,
+                         [("c", ("f2", "f3")), ("d", ("f2", "f3"))])
+        mid.close()
+
+        # 再重启: 失效状态与历史依据不变, 不出现幻影依据
+        again = Store(self.db)
+        self.assertEqual(again.tms.nodes["c"].status, "inactive")
+        self.assertEqual(again.tms.nodes["d"].status, "inactive")
+        self.assertEqual(
+            sorted(s.rule_id for s in again.tms.nodes["c"].retired_supports),
+            ["r1", "r2"])
+        self.assertEqual(
+            [s.basis for s in again.tms.nodes["d"].retired_supports],
+            [("f2", "f3")])
+        again.close()
+
     def test_invalid_rule_does_not_persist_or_pollute(self):
         store = Store(self.db)
         store.add_fact("a")

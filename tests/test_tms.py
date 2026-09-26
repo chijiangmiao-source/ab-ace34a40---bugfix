@@ -84,6 +84,36 @@ class RetractionTests(unittest.TestCase):
         self.assertEqual(t.explain("c"), [])
         self.assertEqual(t.explain("d"), [])
 
+    def test_alternative_support_refreshes_all_downstream_bases(self):
+        # 中间结论 m 有两条路径; n、p 是仅依赖 m 的两层有效下游.
+        # 撤回路径一后, m/n/p 都必须换成当前完整事实依据, 不能残留 f1.
+        t = TMS()
+        for f in ("f1", "f2", "f3", "x"):
+            t.add_fact(f)
+        t.add_rule("r1", "m", ["f1"])
+        t.add_rule("r2", "m", ["f2", "f3"])
+        t.add_rule("r3", "n", ["m", "x"])
+        t.add_rule("r4", "p", ["n"])
+        rec = t.retract("f1")
+        self.assertEqual(t.nodes["m"].status, "active")
+        self.assertEqual(t.nodes["n"].status, "active")
+        self.assertEqual(t.nodes["p"].status, "active")
+        self.assertEqual(rec.survived, ["m"])
+        self.assertEqual(t.explain("m")[0].basis, ("f2", "f3"))
+        self.assertEqual(t.explain("n")[0].basis, ("f2", "f3", "x"))
+        self.assertEqual(t.explain("p")[0].basis, ("f2", "f3", "x"))
+
+        # 最后一条支持耗尽: 传播链每一步的依据都对应当刻实际有效的支持
+        rec2 = t.retract("f2")
+        self.assertEqual([(s.node_id, s.exhausted_basis)
+                          for s in rec2.propagation_chain],
+                         [("m", ("f2", "f3")),
+                          ("n", ("f2", "f3", "x")),
+                          ("p", ("f2", "f3", "x"))])
+        self.assertEqual(t.explain("m"), [])
+        self.assertEqual(t.explain("n"), [])
+        self.assertEqual(t.explain("p"), [])
+
     def test_conclusion_only_fails_when_no_complete_support(self):
         # 中间节点多路径, 下游共享: 撤回一条路径不应误杀
         t = TMS()

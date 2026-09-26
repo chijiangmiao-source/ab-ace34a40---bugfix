@@ -97,44 +97,60 @@ class Store:
         for row in rules:  # 加入时会重算当前支持
             ants: List[str] = json.loads(row["antecedents"])
             t.add_rule(row["id"], row["conclusion"], ants)
-        # 恢复事实撤回状态后重算
+        # 恢复事实撤回状态后重算: 得到与事实/规则一致的当前状态
         for row in rows:
             if not row["active"]:
                 t.nodes[row["id"]].fact_active = False
         t.refresh()
 
-        active_supports: Dict[str, List[Support]] = {}
-        current = self._conn.execute(
+        # supports 表是单一事务内提交的权威依据状态. 重放重算只用于确定
+        # 节点有效性; 具体的当前/历史依据 (含历史触发时刻的事实层展开)
+        # 一律以落盘行准, 避免重放凭空生成 "失效过又切换走" 的幻影历史依据.
+        current_rows = self._conn.execute(
             "SELECT node_id, rule_id, antecedents_json, basis_json "
-            "FROM supports WHERE active = 1"
+            "FROM supports WHERE active = 1 ORDER BY rowid"
         ).fetchall()
-        for row in current:
-            active_supports.setdefault(row["node_id"], []).append(Support(
-                rule_id=row["rule_id"],
-                antecedents=tuple(json.loads(row["antecedents_json"])),
-                basis=tuple(json.loads(row["basis_json"])),
-            ))
-        for node, supports in active_supports.items():
-            st = t.nodes.get(node)
-            if st is not None and not st.is_fact and st.status == "active":
-                st.supports = supports
+        retired_rows = self._conn.execute(
+            "SELECT node_id, rule_id, antecedents_json, basis_json "
+            "FROM supports WHERE active = 0 ORDER BY rowid"
+        ).fetchall()
 
-        # 恢复已耗尽的历史依据 (去重, 避免与当前支持重复)
-        retired = self._conn.execute(
-            "SELECT node_id, rule_id, antecedents_json, basis_json "
-            "FROM supports WHERE active = 0"
-        ).fetchall()
-        for row in retired:
-            node = row["node_id"]
-            if node not in t.nodes:
+        current_by_node: Dict[str, List[Support]] = {}
+        retired_by_node: Dict[str, List[Support]] = {}
+        for bucket, rows_ in ((current_by_node, current_rows),
+                              (retired_by_node, retired_rows)):
+            for row in rows_:
+                bucket.setdefault(row["node_id"], []).append(Support(
+                    rule_id=row["rule_id"],
+                    antecedents=tuple(json.loads(row["antecedents_json"])),
+                    basis=tuple(json.loads(row["basis_json"])),
+                ))
+
+        for node, st in t.nodes.items():
+            if st.is_fact:
                 continue
-            sup = Support(
-                rule_id=row["rule_id"],
-                antecedents=tuple(json.loads(row["antecedents_json"])),
-                basis=tuple(json.loads(row["basis_json"])),
-            )
-            if sup not in t.nodes[node].retired_supports and sup not in t.nodes[node].supports:
-                t.nodes[node].retired_supports.append(sup)
+            live = current_by_node.get(node, [])
+            retired = retired_by_node.get(node, [])
+            live_keys = {(s.rule_id, s.antecedents) for s in live}
+            # 历史依据去重, 且与当前支持同键/同值的历史行不再展示为 "已耗尽"
+            seen: List[Support] = []
+            cleaned: List[Support] = []
+            for sup in retired:
+                if (sup.rule_id, sup.antecedents) in live_keys:
+                    continue
+                if sup in live or sup in seen:
+                    continue
+                seen.append(sup)
+                cleaned.append(sup)
+            if st.status == "active" and live:
+                # 落盘的当前依据为准 (与重算结果一致, 且保留精确事实层展开)
+                st.supports = live
+            else:
+                st.supports = []
+                if st.status == "active":
+                    st.status = "inactive"
+                    st.reason = "所有完整支持均已耗尽"
+            st.retired_supports = cleaned
 
         # 恢复撤回顺序与历史裁决 (幂等重复撤回用)
         order = [r["fact_id"] for r in self._conn.execute(

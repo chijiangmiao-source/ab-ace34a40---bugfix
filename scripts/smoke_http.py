@@ -77,7 +77,8 @@ def conclusions_map(state: dict) -> Dict[str, dict]:
     return {c["id"]: c for c in state["conclusions"]}
 
 
-def run_scenario(base: str) -> None:
+def run_scenario_prefix(base: str) -> None:
+    """健康检查、规程编辑、非法规则拒绝、第一次撤回 (替代路径保留)。"""
     print("[smoke] 1) 健康检查")
     h = request(base, "GET", "/api/health")
     check(h["status"] == "ok" and h["database"] == "ok", "健康检查报告接口与持久层可用")
@@ -138,6 +139,27 @@ def run_scenario(base: str) -> None:
     check(cs["d"]["supports"][0]["basis"] == ["f2", "f3"],
           "下游 d 的展开依据同步刷新为 {f2, f3}")
 
+
+def assert_surviving_basis(base: str, where: str) -> None:
+    """核对第一次撤回后两层结论的当前依据 (重启前后均应一致)。"""
+    state = request(base, "GET", "/api/state")
+    cs = conclusions_map(state)
+    check(cs["c"]["status"] == "active" and cs["d"]["status"] == "active",
+          f"{where}: c/d 仍凭自动路径有效")
+    check(cs["c"]["supports"] and cs["c"]["supports"][0]["rule_id"] == "r2"
+          and cs["c"]["supports"][0]["basis"] == ["f2", "f3"],
+          f"{where}: fire_confirmed(c) 当前依据为 {{f2, f3}}")
+    check(cs["d"]["supports"] and cs["d"]["supports"][0]["basis"] == ["f2", "f3"],
+          f"{where}: must_evacuate(d) 当前依据已同步为 {{f2, f3}} (无已撤回事实残留)")
+    check({s["rule_id"] for s in cs["c"]["retired_supports"]} == {"r1"},
+          f"{where}: 仅已耗尽的路径一 r1 留作历史依据")
+    facts = {f["id"]: f["active"] for f in state["facts"]}
+    check(facts["f1"] is False and facts["f2"] is True and facts["f3"] is True,
+          f"{where}: 事实撤回状态正确 (f1 已撤回, f2/f3 有效)")
+
+
+def run_scenario_suffix(base: str) -> None:
+    """第二次撤回 -> 传播链, 重复撤回幂等, 页面/单项接口。"""
     print("[smoke] 4) 撤回最后一条支持事实 -> 结论与唯一下游失效 + 传播链")
     out = request(base, "POST", "/api/retract", {"fact_id": "f2"})
     v = out["verdict"]
@@ -149,10 +171,14 @@ def run_scenario(base: str) -> None:
     affected_c = next(a for a in v["affected"] if a["node_id"] == "c")
     check(affected_c["complete_basis"] == ["f2", "f3"],
           "受影响结论 c 附带失效前的完整依据")
-    chain = [(s["node_id"], s["triggered_by"], s["rule_id"])
+    affected_d = next(a for a in v["affected"] if a["node_id"] == "d")
+    check(affected_d["complete_basis"] == ["f2", "f3"],
+          "下游 d 失效前依据为自动路径 {f2, f3} (不含已撤回的 f1)")
+    chain = [(s["node_id"], s["triggered_by"], s["rule_id"], s["exhausted_basis"])
              for s in v["propagation_chain"]]
-    check(chain == [("c", "f2", "r2"), ("d", "c", "r3")],
-          "展示支持耗尽形成的传播链 f2→c→d")
+    check(chain == [("c", "f2", "r2", ["f2", "f3"]),
+                    ("d", "c", "r3", ["f2", "f3"])],
+          "展示支持耗尽形成的传播链 f2→c→d, 每步依据对应当刻有效支持")
     check(not cs["c"]["supports"] and not cs["d"]["supports"],
           "失效结论不再有任何当前完整支持")
     check({s["rule_id"] for s in cs["c"]["retired_supports"]} == {"r1", "r2"},
@@ -174,6 +200,19 @@ def run_scenario(base: str) -> None:
           "GET /api/conclusions/c 返回该结论的完整依据状态")
 
 
+def run_restart_between_check(port: int, db_path: str) -> None:
+    """两次撤回之间重启: 查询有效疏散结论的当前完整依据。"""
+    print("[smoke] 3b) 两次撤回之间重启服务, 复核两层结论当前依据")
+    proc, base = start_server(port, db_path)
+    try:
+        wait_ready(base)
+        assert_surviving_basis(base, "重启后查询")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+    return base
+
+
 def run_restart_check(port: int, db_path: str) -> None:
     print("[smoke] 7) 重启后查询仍保留结论与依据状态")
     proc, base = start_server(port, db_path)
@@ -185,6 +224,9 @@ def run_restart_check(port: int, db_path: str) -> None:
               "重启后 c/d 仍为失效")
         check({s["rule_id"] for s in cs["c"]["retired_supports"]} == {"r1", "r2"},
               "重启后历史完整依据仍保留")
+        check(cs["d"]["retired_supports"]
+              and cs["d"]["retired_supports"][0]["basis"] == ["f2", "f3"],
+              "重启后 d 的历史依据仍是自动路径 {f2, f3}, 无过期手动报警依据")
         facts = {f["id"]: f["active"] for f in state["facts"]}
         check(facts["f1"] is False and facts["f2"] is False and facts["f3"] is True,
               "重启后事实撤回状态保留, f3 仍有效")
@@ -212,7 +254,9 @@ def main() -> int:
         if base_url:
             print(f"[smoke] 在线模式: {base_url} (要求服务为干净初始状态)")
             wait_ready(base_url)
-            run_scenario(base_url)
+            run_scenario_prefix(base_url)
+            assert_surviving_basis(base_url, "第一次撤回后")
+            run_scenario_suffix(base_url)
         else:
             tmp = tempfile.TemporaryDirectory()
             db_path = os.path.join(tmp.name, "smoke.db")
@@ -220,11 +264,22 @@ def main() -> int:
             proc, base = start_server(port, db_path)
             try:
                 wait_ready(base)
-                run_scenario(base)
+                run_scenario_prefix(base)
+                assert_surviving_basis(base, "第一次撤回后")
             finally:
                 proc.terminate()
                 proc.wait(timeout=10)
-            run_restart_check(port + 1, db_path)
+            # 两次撤回之间重启: 复核有效结论的当前完整依据无过期残留
+            run_restart_between_check(port + 1, db_path)
+            # 新进程内完成第二次撤回 (经真实 HTTP), 再核对完整传播链
+            proc2, base2 = start_server(port + 2, db_path)
+            try:
+                wait_ready(base2)
+                run_scenario_suffix(base2)
+            finally:
+                proc2.terminate()
+                proc2.wait(timeout=10)
+            run_restart_check(port + 3, db_path)
             tmp.cleanup()
     except Failure as e:
         print(f"\n[smoke] 失败: {e}", file=sys.stderr)
